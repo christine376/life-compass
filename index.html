@@ -8548,92 +8548,66 @@ function showSchemeHelp(){
  * 实现跨设备/网页版的导入导出式同步（全量覆盖，last-write-wins）。无需复杂后端。
  */
 const CloudSync = {
-    client: null,
+    db: null,
+    app: null,
     config: null,
-    /* 使用数据库表存储备份（而非 Storage 文件），避免 Storage API 的严格 CORS 限制 */
-    tableName: 'lc_sync_backup',
+    tableName: 'sync',
     init(){ this.config = DataManager.get('cloudSyncConfig') || null; },
-    _hasLib(){ return (typeof window.supabase !== 'undefined') && !!window.supabase.createClient; },
-    _normalizeUrl(raw){
-        if(!raw) return '';
-        let u = String(raw).trim().replace(/\/+$/,'');
-        u = u.replace(/\/(rest|auth|storage|functions)\/v\d*\/?$/i,'');
-        if(/\.supabase\.(com|co|net|org|io)$/i.test(u) === false && /\.supabase$/i.test(u)){ u += '.co'; }
-        if(/^[a-z0-9]([\w.-]*[a-z0-9])?$/i.test(u) && !/^[a-z][a-z0-9+.-]*:/i.test(u)){ u = 'https://' + u; }
-        return u;
-    },
-    _validateUrl(u){
-        if(!u) return 'URL 不能为空';
-        if(!/^https?:\/\/[a-z0-9.-]+\.supabase\.(co|com|net|org|io)/i.test(u)){
-            return 'URL 格式不对，应为 https://xxxxx.supabase.co（不要带 /rest/v1 等路径）';
-        }
-        return '';
-    },
-    _isFileOrigin(){
-        try { const p = location.protocol; return p === 'file:' || (!p || p === ':'); } catch(e){ return false; }
-    },
-    _corsWarning(){
-        return `⚠️ 当前从「本地文件」（${location.protocol}）打开，浏览器会阻止向 Supabase 发送请求（CORS 限制）。
-<br><br>🔧 解决方法（任选其一）：
-<br>① <b>发布为在线应用</b>：获得一个可访问的 https 网址，用该网址打开即可同步。
-<br>② <b>本地起 HTTP 服务</b>：在文件所在目录打开终端，运行 <code style="background:#eee;padding:2px 6px;border-radius:4px;">python -m http.server 8080</code>，浏览器打开 <code>http://localhost:8080</code>。
-<br>③ <b>部署到静态托管</b>（GitHub Pages / Vercel / Netlify 等）。`;
-    },
+    _hasLib(){ return (typeof window.firebase !== 'undefined') && !!window.firebase.database; },
+    /* Firebase 专为浏览器设计，全球（含国内）连通性好，无需配置域名白名单 / CORS */
     ensureLib(){
         return new Promise((resolve, reject) => {
             if (this._hasLib()) return resolve();
-            const s = document.createElement('script');
-            s.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2';
-            s.onload = () => { this._hasLib() ? resolve() : reject(new Error('Supabase 库加载完成但不可用')); };
-            s.onerror = () => reject(new Error('Supabase 库加载失败（请检查网络后重试）'));
-            document.head.appendChild(s);
+            const scripts = [
+                'https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js',
+                'https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js'
+            ];
+            let loaded = 0;
+            scripts.forEach(src => {
+                const s = document.createElement('script');
+                s.src = src;
+                s.onload = () => { loaded++; if(loaded===scripts.length){ this._hasLib()?resolve():reject(new Error('Firebase 库加载完成但不可用')); } };
+                s.onerror = () => reject(new Error('Firebase 库加载失败（请检查网络）'));
+                document.head.appendChild(s);
+            });
         });
     },
-    connect(){
-        if (!this._hasLib()) return false;
-        const url = this._normalizeUrl(this.config.url);
-        const key = (this.config.anonKey||'').trim();
-        if(!url || !key){ showToast('❌ 配置不完整：需填写 URL 和 anon key','error'); return false; }
-        const urlErr = this._validateUrl(url);
-        if(urlErr){ showToast('❌ '+urlErr,'error'); return false; }
-        try { this.client = window.supabase.createClient(url, key); return true; }
-        catch(e){ console.error(e); showToast('❌ 连接失败：'+(e.message||'未知错误'),'error'); return false; }
+    _genVaultId(){
+        const chars='abcdefghijklmnopqrstuvwxyz0123456789';
+        let s=''; for(let i=0;i<24;i++) s+=chars[Math.floor(Math.random()*chars.length)];
+        return s;
     },
+    connect(){
+        if(!this._hasLib()) return false;
+        const c=this.config;
+        if(!c || !c.apiKey || !c.databaseURL || !c.projectId){ showToast('❌ 请先填写 Firebase 配置','error'); return false; }
+        try {
+            if(!this.app){ this.app = window.firebase.initializeApp({ apiKey:c.apiKey, databaseURL:c.databaseURL, projectId:c.projectId }); }
+            this.db = window.firebase.database();
+            return true;
+        } catch(e){ console.error(e); showToast('❌ Firebase 初始化失败：'+(e.message||''),'error'); return false; }
+    },
+    _ref(){ const vid = (this.config.vaultId||'default'); return this.db.ref(this.tableName+'/'+vid); },
     saveConfig(){ DataManager.set('cloudSyncConfig', this.config); },
-    isConfigured(){ return !!(this.config && this.config.url && this.config.anonKey); },
+    isConfigured(){ return !!(this.config && this.config.apiKey && this.config.databaseURL && this.config.projectId && this.config.vaultId); },
     setStatus(html){ const el = document.getElementById('syncStatus'); if (el) el.innerHTML = html || ''; },
 
-    /* 通过 REST API（数据库表）上传备份 —— 比 Storage API 的跨域兼容性好得多 */
     async upload(){
-        if (!this.isConfigured()){ showToast('请先填写 Supabase 配置', 'warning'); return false; }
-        if (this._isFileOrigin()){ this.setStatus('❌ 上传失败（CORS）'); showModal({ title:'⚠️ 无法连接云服务', content:this._corsWarning(), confirmText:'知道了', showCancel:false }); return false; }
-
-        this.setStatus('⏳ 正在加载 Supabase 库…');
-        try { await this.ensureLib(); } catch(e){ this.setStatus('❌ 库加载失败'); showToast('❌ 库加载失败：'+(e.message||''),'error'); return false; }
-
-        this.setStatus('⏳ 正在连接 Supabase…');
+        if (!this.isConfigured()){ showToast('请先填写 Firebase 配置（含同步密钥）', 'warning'); return false; }
+        this.setStatus('⏳ 正在加载 Firebase 库…');
+        try { await this.ensureLib(); } catch(e){ this.setStatus('❌ 库加载失败'); showToast('❌ Firebase 库加载失败：'+(e.message||''),'error'); return false; }
+        this.setStatus('⏳ 正在连接 Firebase…');
         if (!this.connect()) return false;
-
         this.setStatus('⏳ 正在打包数据…'); showToast('☁️ 正在上传到云…', 'info');
         try {
             const data = DataManager.exportAllData();
             let media = [];
             try { if (typeof MediaStore !== 'undefined' && MediaStore.available()) media = await MediaStore.exportAll(); } catch(e){ console.warn('媒体导出失败', e); }
-            const payload = { id: 1, app:'life-compass', version:2, updatedAt:new Date().toISOString(), data, media };
+            const payload = { app:'life-compass', version:3, updatedAt:new Date().toISOString(), data, media };
             const jsonStr = JSON.stringify(payload);
-
-            this.setStatus('⏳ 正在上传到云端（数据库表模式）…');
-            console.log('[CloudSync] 上传到表 '+this.tableName+', 大小:', (jsonStr.length/1024).toFixed(1)+'KB');
-
-            /* 用 upsert 写入数据库表（id=1 固定，始终覆盖同一条记录） */
-            const { data:res, error } = await this.client
-                .from(this.tableName)
-                .upsert(payload, { onConflict:'id', returning:'minimal' })
-                .select('id,updatedAt');
-
-            console.log('[CloudSync] 上传结果:', { res, error });
-            if (error) throw error;
-
+            this.setStatus('⏳ 正在上传到 Firebase…');
+            console.log('[CloudSync] 上传到 Firebase 大小:', (jsonStr.length/1024).toFixed(1)+'KB');
+            await this._ref().set(payload);
             this.config.lastSync = payload.updatedAt; this.saveConfig();
             this.setStatus('✅ 已上传：' + payload.updatedAt);
             showToast('✅ 已上传到云（' + (jsonStr.length/1024).toFixed(0) + ' KB）', 'success');
@@ -8641,43 +8615,24 @@ const CloudSync = {
         } catch(e){
             console.error('[CloudSync] 上传异常:', e);
             this.setStatus('❌ 上传失败');
-            const msg = (e.message || e.error_description || String(e));
-            let hint = msg;
-            if(/Failed to fetch|NetworkError|network/i.test(msg)){
-                hint = '网络请求被阻止。\n① 检查 Supabase 项目是否暂停（Dashboard 首页看状态）\n② 确认 Authentication → URL Configuration 已添加当前网址\n③ 按 F12 → Console 查看详细红色错误';
-            }
-            else if(/relation.*does not exist|42P01/i.test(msg)){
-                hint = msg + '\n💡 需要先创建同步表！请在 Supabase SQL Editor 执行建表 SQL（见弹窗下方说明）。';
-            }
-            else if(/permission|denied|RLS|insufficient/i.test(msg)){
-                hint = msg + '\n💡 需要给该表配置 RLS 策略（见弹窗下方 SQL）。';
-            }
-            showToast('❌ 上传失败：' + hint, 'error');
+            showToast('❌ 上传失败：' + (e.message || e.error_description || String(e)), 'error');
             return false;
         }
     },
 
-    /* 从数据库表下载备份 */
     async download(){
-        if (!this.isConfigured()){ showToast('请先填写 Supabase 配置', 'warning'); return false; }
-        if (this._isFileOrigin()){ this.setStatus('❌ 拉取失败（CORS）'); showModal({ title:'⚠️ 无法连接云服务', content:this._corsWarning(), confirmText:'知道了', showCancel:false }); return false; }
+        if (!this.isConfigured()){ showToast('请先填写 Firebase 配置（含同步密钥）', 'warning'); return false; }
         if (!confirm('从云拉取会用云端备份【覆盖】本地数据，建议先点📤导出一份本地备份。继续？')) return false;
-        try { await this.ensureLib(); if (!this.connect()){ showToast('Supabase 初始化失败', 'error'); return false; } }
-        catch(e){ showToast(e.message || 'Supabase 库加载失败', 'error'); return false; }
+        try { await this.ensureLib(); if (!this.connect()){ showToast('Firebase 初始化失败', 'error'); return false; } }
+        catch(e){ showToast(e.message || 'Firebase 库加载失败', 'error'); return false; }
         this.setStatus('⏳ 正在拉取…'); showToast('☁️ 正在从云拉取…', 'info');
         try {
-            const { data: rows, error } = await this.client
-                .from(this.tableName)
-                .select('data,media,updatedAt')
-                .eq('id', 1)
-                .single();
-            console.log('[CloudSync] 拉取结果:', { rows, error });
-            if (error) throw error;
-            if (!rows || !rows.data) throw new Error('云端没有找到备份数据（id=1 不存在），请先上传一次。');
-
-            DataManager.importAllData(rows.data);
-            if (rows.media && typeof MediaStore !== 'undefined' && MediaStore.available()) { try { await MediaStore.importAll(rows.media); } catch(e){ console.warn('媒体导入失败', e); } }
-            this.config.lastSync = rows.updatedAt || new Date().toISOString(); this.saveConfig();
+            const snap = await this._ref().once('value');
+            const payload = snap.val();
+            if (!payload || !payload.data) throw new Error('云端没有找到备份数据，请先上传一次。');
+            DataManager.importAllData(payload.data);
+            if (payload.media && typeof MediaStore !== 'undefined' && MediaStore.available()) { try { await MediaStore.importAll(payload.media); } catch(e){ console.warn('媒体导入失败', e); } }
+            this.config.lastSync = payload.updatedAt || new Date().toISOString(); this.saveConfig();
             this.setStatus('✅ 已拉取：' + this.config.lastSync);
             showToast('✅ 已从云拉取，即将刷新页面…', 'success');
             setTimeout(() => { location.reload(); }, 900);
@@ -8689,17 +8644,21 @@ const CloudSync = {
             return false;
         }
     },
+
     showConfigModal(){
-        if (!this.config) this.config = { url:'', anonKey:'', bucket:this.bucket, filePath:this.filePath, lastSync:null };
+        if (!this.config) this.config = { apiKey:'', databaseURL:'', projectId:'', vaultId:'', lastSync:null };
+        if (!this.config.vaultId) this.config.vaultId = this._genVaultId();
         const c = this.config;
         const last = c.lastSync ? ('上次同步：' + c.lastSync) : '尚未同步';
         const content = `
             <div style="background:#f6f9f6;border:1px solid var(--border-color);border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.7;color:var(--text-secondary);margin-bottom:12px;">
-                <b>📌 这是「全量覆盖式」云备份</b>：会把整个人生罗盘（含图片/视频）作为一个文件存到你的 Supabase 网盘，换设备/网页版用「从云拉取」即可恢复。无需自建服务器。
+                <b>📌 全量覆盖式云备份</b>：存到你的 Firebase 实时数据库，换设备/网页版用「从云拉取」即可恢复。Firebase 全球连通性好，无需配置域名白名单。
             </div>
-            <div class="form-group"><label>Supabase 项目 URL <span style="font-size:11px;color:var(--text-muted);">（只需域名，如 https://xxxx.supabase.co，不要带 /rest/v1）</span></label><input id="syncUrl" value="${esc(c.url||'')}" placeholder="https://xxxx.supabase.co"></div>
-            <div class="form-group"><label>anon / public key（公开密钥，可放前端）</label><input id="syncKey" value="${esc(c.anonKey||'')}" placeholder="eyJhbGci...你的 anon key"></div>
-            <div id="syncStatus" style="font-size:12px;color:var(--text-muted);margin:6px 0 10px;">${last}${this._isFileOrigin()?'<br><span style="color:#e67e22;">⚠️ 检测到本地文件模式，云同步可能因 CORS 被浏览器阻止，建议通过 HTTP 服务访问</span>':''}</div>
+            <div class="form-group"><label>Firebase API Key</label><input id="syncKey" value="${esc(c.apiKey||'')}" placeholder="AIzaSy..."></div>
+            <div class="form-group"><label>数据库地址 (databaseURL)</label><input id="syncDb" value="${esc(c.databaseURL||'')}" placeholder="https://xxx-default-rtdb.firebaseio.com"></div>
+            <div class="form-group"><label>项目 ID (projectId)</label><input id="syncProj" value="${esc(c.projectId||'')}" placeholder="xxx"></div>
+            <div class="form-group"><label>同步密钥 (Vault ID) <span style="font-size:11px;color:var(--text-muted);">两端必须填一样的才能互通</span></label><input id="syncVault" value="${esc(c.vaultId||'')}" placeholder="留空将自动生成"></div>
+            <div id="syncStatus" style="font-size:12px;color:var(--text-muted);margin:6px 0 10px;">${last}</div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
                 <button type="button" class="btn-primary" id="syncSave">💾 保存配置</button>
                 <button type="button" class="btn-cancel" id="syncTest">🔗 测试连接</button>
@@ -8708,90 +8667,55 @@ const CloudSync = {
                 <button type="button" class="btn-cancel" id="syncClear">🗑️ 清空配置</button>
             </div>
             <details style="font-size:13px;color:var(--text-secondary);">
-                <summary style="cursor:pointer;font-weight:600;">👣 第一次用？2 步准备 Supabase（30 秒）</summary>
+                <summary style="cursor:pointer;font-weight:600;">👣 第一次用？Firebase 准备步骤（2 分钟）</summary>
                 <ol style="line-height:1.8;padding-left:20px;margin-top:8px;">
-                    <li>打开 <a href="https://supabase.com" target="_blank" rel="noopener">supabase.com</a> 免费注册 → New Project → 记下 <b>Project URL</b> 和 <b>API anon key</b>（Project Settings → API）。</li>
-                    <li>左侧 <b>SQL Editor</b> 粘贴下面这段并执行（创建同步表 + 授权 anon 读写）：
-<pre style="background:#1e1e1e;color:#d4d4d4;padding:10px;border-radius:8px;overflow:auto;font-size:11px;">-- 创建同步表
-create table if not exists public.lc_sync_backup (
-  id int primary key default 1,
-  app text not null default 'life-compass',
-  version int not null default 2,
-  updated_at timestamptz,
-  data jsonb,
-  media jsonb
-);
--- 允许 anon 读写
-alter table public.lc_sync_backup enable row level security;
-create policy "lc_sel" on public.lc_sync_backup for select using (true);
-create policy "lc_ins" on public.lc_sync_backup for insert with check (true);
-create policy "lc_upd" on public.lc_sync_backup for update using (true);</pre></li>
+                    <li>打开 <a href="https://console.firebase.google.com" target="_blank" rel="noopener">console.firebase.google.com</a> → 创建项目（免费）。</li>
+                    <li>左侧 <b>Build → Realtime Database</b> → 创建数据库（区域选离你近的，如 asia-southeast1）。</li>
+                    <li>⚙️ 项目设置 → <b>你的应用 → Web 应用（&lt;/&gt; 图标）</b> → 注册，复制配置里的 <b>apiKey / databaseURL / projectId</b> 填到上方。</li>
+                    <li><b>Realtime Database → Rules</b>，粘贴下面规则并发布：
+<pre style="background:#1e1e1e;color:#d4d4d4;padding:10px;border-radius:8px;overflow:auto;font-size:11px;">{
+  "rules": {
+    "sync": {
+      "$vid": {
+        ".read": true,
+        ".write": true
+      }
+    }
+  }
+}</pre></li>
                 </ol>
-                <p style="margin-top:8px;font-size:12px;color:var(--text-muted);">💡 使用数据库表模式（而非文件存储），跨域兼容性更好，无需额外配置 Storage CORS。</p>
+                <p style="margin-top:8px;font-size:12px;color:var(--text-muted);">💡 「同步密钥」相当于你的私人保险箱密码（24 位随机串），别人不知道就无法读取你的数据；手机和电脑填同一个密钥即可互通。</p>
             </details>`;
-        showModal({ title:'☁️ 同步到云（Supabase）', content, confirmText:'关闭', showCancel:false });
+        showModal({ title:'☁️ 同步到云（Firebase）', content, confirmText:'关闭', showCancel:false });
         const self = this;
-        const urlEl = document.getElementById('syncUrl');
         const keyEl = document.getElementById('syncKey');
+        const dbEl = document.getElementById('syncDb');
+        const projEl = document.getElementById('syncProj');
+        const vaultEl = document.getElementById('syncVault');
         document.getElementById('syncSave').addEventListener('click', () => {
-            const rawUrl = urlEl.value.trim();
-            const normUrl = self._normalizeUrl(rawUrl);
-            if(rawUrl && rawUrl !== normUrl){
-                urlEl.value = normUrl;
-                showToast('📝 URL 已自动修正为：'+normUrl,'info');
-            }
-            const urlErr = normUrl ? self._validateUrl(normUrl) : '';
-            if(urlErr){ showToast('❌ '+urlErr,'error'); return; }
-            self.config = { url:normUrl, anonKey:keyEl.value.trim(), lastSync:self.config?self.config.lastSync:null };
+            let vid = vaultEl.value.trim();
+            if(!vid){ vid = self._genVaultId(); vaultEl.value = vid; showToast('📝 已自动生成同步密钥：'+vid,'info'); }
+            self.config = { apiKey:keyEl.value.trim(), databaseURL:dbEl.value.trim(), projectId:projEl.value.trim(), vaultId:vid, lastSync:self.config?self.config.lastSync:null };
             self.saveConfig();
-            self.setStatus(self.isConfigured() ? '✅ 配置已保存' : '⚠️ 请填 URL 与 key');
+            self.setStatus(self.isConfigured() ? '✅ 配置已保存' : '⚠️ 请填完整');
             showToast(self.isConfigured()?'✅ 配置已保存':'⚠️ 请填写完整', self.isConfigured()?'success':'warning');
         });
         document.getElementById('syncUp').addEventListener('click', () => { self.upload(); });
         document.getElementById('syncDown').addEventListener('click', () => { self.download(); });
-        /* 测试连接：通过 REST API 查询数据库表来验证连通性 */
         document.getElementById('syncTest').addEventListener('click', async () => {
-            const rawUrl = urlEl.value.trim();
-            const normUrl = self._normalizeUrl(rawUrl);
-            const key = keyEl.value.trim();
-            if(!normUrl || !key){ showToast('⚠️ 请先填 URL 和 anon key','warning'); return; }
+            const apiKey=keyEl.value.trim(), dbUrl=dbEl.value.trim(), pid=projEl.value.trim();
+            if(!apiKey || !dbUrl || !pid){ showToast('⚠️ 请先填 Firebase 配置','warning'); return; }
             self.setStatus('🔗 正在测试连接…');
             try {
                 await self.ensureLib();
-                const testClient = window.supabase.createClient(normUrl, key);
-                self.setStatus('🔗 正在检测数据库表…');
-                /* 尝试查询同步表 —— 表不存在会返回特定错误，能连上说明 REST API 通了 */
-                const { data, error } = await testClient
-                    .from(self.tableName)
-                    .select('id,updatedAt')
-                    .eq('id', 1)
-                    .maybeSingle();
-                console.log('[CloudSync] 测试连接结果:', { data, error });
-                if(error && /Failed to fetch|NetworkError/i.test(error.message||'')){
-                    self.setStatus('❌ 连接失败（网络）');
-                    showModal({ title:'❌ 无法连接 Supabase',
-                        content:`<p>请求被阻止（<b>${esc(error.message)}</b>）。请依次排查：</p>
-                        <ol style="line-height:2;padding-left:20px;">
-                        <li><b>检查项目是否暂停</b>：去 Supabase Dashboard 首页，如果看到「Paused」或「Resume project」按钮，点一下恢复。</li>
-                        <li><b>确认域名已加入白名单</b>：Authentication → URL Configuration 的 Site URL 和 Redirect URLs 都要包含当前网址。</li>
-                        <li><b>按 F12 打开开发者工具</b> → Console 标签，点「测试连接」后看红色错误信息，截图发给我。</li>
-                        </ol>`,
-                        confirmText:'知道了', showCancel:false });
-                    return;
-                }
-                if(error && /relation.*does not exist|42P01/i.test(error.message)){
-                    self.setStatus('✅ 网络已通！表尚未创建（首次上传时自动建）');
-                    showToast('✅ 连接成功！数据库表还未创建，上传时会自动处理。','success');
-                    return;
-                }
-                if(error){
-                    self.setStatus('❌ '+error.message);
-                    showToast('❌ 查询失败：'+error.message,'error');
-                    return;
-                }
-                const ts = data ? data.updatedAt : '无';
-                self.setStatus('✅ 连接成功！云端备份时间：'+ts);
-                showToast(data?'✅ 连接成功，云端有备份（'+ts+'）':'✅ 连通，但暂无备份数据','success');
+                const testClient = window.firebase.initializeApp({ apiKey, databaseURL:dbUrl, projectId:pid }, 'test');
+                const testDb = window.firebase.database(testClient);
+                const vid = vaultEl.value.trim() || 'test';
+                self.setStatus('🔗 正在检测数据库…');
+                const snap = await testDb.ref(self.tableName+'/'+vid).once('value');
+                console.log('[CloudSync] 测试连接结果:', snap.exists()?'空但有数据节点':'可访问');
+                self.setStatus('✅ 连接成功！可以上传');
+                showToast('✅ 连接成功，可以上传','success');
             } catch(e){
                 console.error('[CloudSync] 测试连接异常:', e);
                 self.setStatus('❌ 测试失败');
@@ -8799,8 +8723,8 @@ create policy "lc_upd" on public.lc_sync_backup for update using (true);</pre></
             }
         });
         document.getElementById('syncClear').addEventListener('click', () => {
-            if (!confirm('清空本地保存的 Supabase 配置？')) return;
-            self.config = { url:'', anonKey:'', lastSync:null };
+            if (!confirm('清空本地保存的 Firebase 配置？')) return;
+            self.config = { apiKey:'', databaseURL:'', projectId:'', vaultId:'', lastSync:null };
             DataManager.remove('cloudSyncConfig'); self.setStatus('尚未同步'); showToast('已清空配置','success');
         });
     }
